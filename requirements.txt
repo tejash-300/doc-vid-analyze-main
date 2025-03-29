@@ -1,8 +1,6 @@
+torch
 fastapi
 uvicorn
-torch
-transformers
-sentence-transformers
 spacy
 pdfplumber
 moviepy
@@ -10,6 +8,12 @@ librosa
 soundfile
 matplotlib
 numpy
+transformers
+sentence-transformers
 pyngrok
-requests
-streamlit
+openai-whisper
+accelerate
+python-multipart
+datasets
+evaluate
+pydantic==1.10.8
