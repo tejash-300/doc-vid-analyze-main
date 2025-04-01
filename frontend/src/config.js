@@ -1,5 +1,5 @@
 // API Configuration
-const API_BASE_URL = "https://1963-35-185-253-183.ngrok-free.app"; // Replace with your actual backend URL
+const API_BASE_URL = "https://tejash300-docanalyzer.hf.space";
 
 export const API_ENDPOINTS = {
   // Document Analysis
