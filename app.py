@@ -1,18 +1,19 @@
 import os
+os.environ["TRANSFORMERS_NO_FAST"] = "1"  # Force use of slow tokenizers
+
 import io
 import torch
 import uvicorn
 import spacy
 import pdfplumber
-import moviepy.editor as mp
 import librosa
 import soundfile as sf
 import matplotlib.pyplot as plt
 import numpy as np
 import json
 import tempfile
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse  # Added HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import pipeline, AutoModelForQuestionAnswering, AutoTokenizer
 from sentence_transformers import SentenceTransformer
@@ -20,12 +21,24 @@ from pyngrok import ngrok
 from threading import Thread
 import time
 import uuid
+import subprocess  # For running ffmpeg commands
+import hashlib  # For caching file results
 
-# Ensure compatibility with Google Colab (if applicable)
+# For asynchronous blocking calls
+from starlette.concurrency import run_in_threadpool
+
+# Import gensim for topic modeling
+import gensim
+from gensim import corpora, models
+
+# Global cache for analysis results based on file hash
+analysis_cache = {}
+
+# Ensure compatibility with Google Colab
 try:
     from google.colab import drive
     drive.mount('/content/drive')
-except:
+except Exception:
     pass  # Skip drive mount if not in Google Colab
 
 # Ensure required directories exist
@@ -47,43 +60,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize document storage
+# In-memory storage for document text and chat history
 document_storage = {}
-chat_history = []  # Global chat history
+chat_history = []
 
 # Function to store document context by task ID
 def store_document_context(task_id, text):
-    """Store document text for retrieval by chatbot."""
     document_storage[task_id] = text
     return True
 
 # Function to load document context by task ID
 def load_document_context(task_id):
-    """Retrieve document text for chatbot context."""
     return document_storage.get(task_id, "")
+
+# Utility to compute MD5 hash from file content
+def compute_md5(content: bytes) -> str:
+    return hashlib.md5(content).hexdigest()
 
 #############################
 #   Fine-tuning on CUAD QA   #
 #############################
 
 def fine_tune_cuad_model():
-    """
-    Fine tunes a question-answering model on the CUAD (Contract Understanding Atticus Dataset)
-    for detailed clause extraction. This demo function uses one epoch for demonstration;
-    adjust training parameters as needed.
-    """
     from datasets import load_dataset
     import numpy as np
-    from transformers import Trainer, TrainingArguments
-    from transformers import AutoModelForQuestionAnswering
+    from transformers import Trainer, TrainingArguments, AutoModelForQuestionAnswering
 
     print("✅ Loading CUAD dataset for fine tuning...")
     dataset = load_dataset("theatticusproject/cuad-qa", trust_remote_code=True)
 
     if "train" in dataset:
-        train_dataset = dataset["train"].select(range(1000))
+        train_dataset = dataset["train"].select(range(50))
         if "validation" in dataset:
-            val_dataset = dataset["validation"].select(range(200))
+            val_dataset = dataset["validation"].select(range(10))
         else:
             split = train_dataset.train_test_split(test_size=0.2)
             train_dataset = split["train"]
@@ -92,7 +101,6 @@ def fine_tune_cuad_model():
         raise ValueError("CUAD dataset does not have a train split")
 
     print("✅ Preparing training features...")
-
     tokenizer = AutoTokenizer.from_pretrained("deepset/roberta-base-squad2")
     model = AutoModelForQuestionAnswering.from_pretrained("deepset/roberta-base-squad2")
 
@@ -144,26 +152,26 @@ def fine_tune_cuad_model():
     print("✅ Tokenizing dataset...")
     train_dataset = train_dataset.map(prepare_train_features, batched=True, remove_columns=train_dataset.column_names)
     val_dataset = val_dataset.map(prepare_train_features, batched=True, remove_columns=val_dataset.column_names)
-
     train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "start_positions", "end_positions"])
     val_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "start_positions", "end_positions"])
 
     training_args = TrainingArguments(
         output_dir="./fine_tuned_legal_qa",
-        evaluation_strategy="steps",
-        eval_steps=100,
+        max_steps=1,
+        evaluation_strategy="no",
         learning_rate=2e-5,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
         num_train_epochs=1,
         weight_decay=0.01,
-        logging_steps=50,
-        save_steps=100,
-        load_best_model_at_end=True,
+        logging_steps=1,
+        save_steps=1,
+        load_best_model_at_end=False,
         report_to=[]
     )
 
     print("✅ Starting fine tuning on CUAD QA dataset...")
+    from transformers import Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -171,13 +179,10 @@ def fine_tune_cuad_model():
         eval_dataset=val_dataset,
         tokenizer=tokenizer,
     )
-
     trainer.train()
     print("✅ Fine tuning completed. Saving model...")
-
     model.save_pretrained("./fine_tuned_legal_qa")
     tokenizer.save_pretrained("./fine_tuned_legal_qa")
-
     return tokenizer, model
 
 #############################
@@ -187,43 +192,49 @@ def fine_tune_cuad_model():
 try:
     try:
         nlp = spacy.load("en_core_web_sm")
-    except:
+    except Exception:
         spacy.cli.download("en_core_web_sm")
         nlp = spacy.load("en_core_web_sm")
     print("✅ Loading NLP models...")
+    from transformers import PegasusTokenizer
+    summarizer = pipeline(
+        "summarization",
+        model="nsi319/legal-pegasus",
+        tokenizer=PegasusTokenizer.from_pretrained("nsi319/legal-pegasus", use_fast=False),
+        device=0 if torch.cuda.is_available() else -1
+    )
+    # Optionally convert summarizer model to FP16 for faster inference on GPU
+    if device == "cuda":
+        summarizer.model.half()
 
-    summarizer = pipeline("summarization", model="nsi319/legal-pegasus",
-                            device=0 if torch.cuda.is_available() else -1)
     embedding_model = SentenceTransformer("all-mpnet-base-v2", device=device)
-    ner_model = pipeline("ner", model="dslim/bert-base-NER",
-                         device=0 if torch.cuda.is_available() else -1)
-    speech_to_text = pipeline("automatic-speech-recognition",
-                              model="openai/whisper-medium",
-                              chunk_length_s=30,
+    ner_model = pipeline("ner", model="dslim/bert-base-NER", device=0 if torch.cuda.is_available() else -1)
+    speech_to_text = pipeline("automatic-speech-recognition", model="openai/whisper-medium", chunk_length_s=30,
                               device_map="auto" if torch.cuda.is_available() else "cpu")
-
-    # Load or Fine Tune CUAD QA Model
     if os.path.exists("fine_tuned_legal_qa"):
         print("✅ Loading fine-tuned CUAD QA model from fine_tuned_legal_qa...")
         cuad_tokenizer = AutoTokenizer.from_pretrained("fine_tuned_legal_qa")
         from transformers import AutoModelForQuestionAnswering
         cuad_model = AutoModelForQuestionAnswering.from_pretrained("fine_tuned_legal_qa")
         cuad_model.to(device)
+        if device == "cuda":
+            cuad_model.half()
     else:
         print("⚠️ Fine-tuned QA model not found. Starting fine tuning on CUAD QA dataset. This may take a while...")
         cuad_tokenizer, cuad_model = fine_tune_cuad_model()
         cuad_model.to(device)
-
     print("✅ All models loaded successfully")
-
 except Exception as e:
     print(f"⚠️ Error loading models: {str(e)}")
     raise RuntimeError(f"Error loading models: {str(e)}")
 
+from transformers import pipeline
 qa_model = pipeline("question-answering", model="deepset/roberta-base-squad2")
 
+# Initialize sentiment-analysis pipeline
+sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english", device=0 if torch.cuda.is_available() else -1)
+
 def legal_chatbot(user_input, context):
-    """Uses a real NLP model for legal Q&A."""
     global chat_history
     chat_history.append({"role": "user", "content": user_input})
     response = qa_model(question=user_input, context=context)["answer"]
@@ -231,7 +242,6 @@ def legal_chatbot(user_input, context):
     return response
 
 def extract_text_from_pdf(pdf_file):
-    """Extracts text from a PDF file using pdfplumber."""
     try:
         with pdfplumber.open(pdf_file) as pdf:
             text = "\n".join([page.extract_text() or "" for page in pdf.pages])
@@ -239,15 +249,20 @@ def extract_text_from_pdf(pdf_file):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"PDF extraction failed: {str(e)}")
 
-def process_video_to_text(video_file_path):
-    """Extract audio from video and convert to text."""
+async def process_video_to_text(video_file_path):
     try:
         print(f"Processing video file at {video_file_path}")
         temp_audio_path = os.path.join("temp", "extracted_audio.wav")
-        video = mp.VideoFileClip(video_file_path)
-        video.audio.write_audiofile(temp_audio_path, codec='pcm_s16le')
+        cmd = [
+            "ffmpeg", "-i", video_file_path, "-vn",
+            "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
+            temp_audio_path, "-y"
+        ]
+        # Run ffmpeg in a separate thread
+        await run_in_threadpool(subprocess.run, cmd, check=True)
         print(f"Audio extracted to {temp_audio_path}")
-        result = speech_to_text(temp_audio_path)
+        # Run speech-to-text in threadpool
+        result = await run_in_threadpool(speech_to_text, temp_audio_path)
         transcript = result["text"]
         print(f"Transcription completed: {len(transcript)} characters")
         if os.path.exists(temp_audio_path):
@@ -257,11 +272,10 @@ def process_video_to_text(video_file_path):
         print(f"Error in video processing: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Video processing failed: {str(e)}")
 
-def process_audio_to_text(audio_file_path):
-    """Process audio file and convert to text."""
+async def process_audio_to_text(audio_file_path):
     try:
         print(f"Processing audio file at {audio_file_path}")
-        result = speech_to_text(audio_file_path)
+        result = await run_in_threadpool(speech_to_text, audio_file_path)
         transcript = result["text"]
         print(f"Transcription completed: {len(transcript)} characters")
         return transcript
@@ -270,7 +284,6 @@ def process_audio_to_text(audio_file_path):
         raise HTTPException(status_code=400, detail=f"Audio processing failed: {str(e)}")
 
 def extract_named_entities(text):
-    """Extracts named entities from legal text."""
     max_length = 10000
     entities = []
     for i in range(0, len(text), max_length):
@@ -279,120 +292,48 @@ def extract_named_entities(text):
         entities.extend([{"entity": ent.text, "label": ent.label_} for ent in doc.ents])
     return entities
 
-def analyze_risk(text):
-    """Analyzes legal risk in the document using keyword-based analysis."""
-    risk_keywords = {
-        "Liability": ["liability", "responsible", "responsibility", "legal obligation"],
-        "Termination": ["termination", "breach", "contract end", "default"],
-        "Indemnification": ["indemnification", "indemnify", "hold harmless", "compensate", "compensation"],
-        "Payment Risk": ["payment", "terms", "reimbursement", "fee", "schedule", "invoice", "money"],
-        "Insurance": ["insurance", "coverage", "policy", "claims"],
-    }
-    risk_scores = {category: 0 for category in risk_keywords}
-    lower_text = text.lower()
-    for category, keywords in risk_keywords.items():
-        for keyword in keywords:
-            risk_scores[category] += lower_text.count(keyword.lower())
-    return risk_scores
+# -----------------------------
+# Enhanced Risk Analysis Functions
+# -----------------------------
 
-def extract_context_for_risk_terms(text, risk_keywords, window=1):
-    """
-    Extracts and summarizes the context around risk terms.
-    """
-    doc = nlp(text)
-    sentences = list(doc.sents)
-    risk_contexts = {category: [] for category in risk_keywords}
-    for i, sent in enumerate(sentences):
-        sent_text_lower = sent.text.lower()
-        for category, details in risk_keywords.items():
-            for keyword in details["keywords"]:
-                if keyword.lower() in sent_text_lower:
-                    start_idx = max(0, i - window)
-                    end_idx = min(len(sentences), i + window + 1)
-                    context_chunk = " ".join([s.text for s in sentences[start_idx:end_idx]])
-                    risk_contexts[category].append(context_chunk)
-    summarized_contexts = {}
-    for category, contexts in risk_contexts.items():
-        if contexts:
-            combined_context = " ".join(contexts)
-            try:
-                summary_result = summarizer(combined_context, max_length=100, min_length=30, do_sample=False)
-                summary = summary_result[0]['summary_text']
-            except Exception as e:
-                summary = "Context summarization failed."
-            summarized_contexts[category] = summary
-        else:
-            summarized_contexts[category] = "No contextual details found."
-    return summarized_contexts
+def analyze_sentiment(text):
+    sentences = [sent.text for sent in nlp(text).sents]
+    if not sentences:
+        return 0
+    results = sentiment_pipeline(sentences, batch_size=16)
+    scores = [res["score"] if res["label"] == "POSITIVE" else -res["score"] for res in results]
+    avg_sentiment = sum(scores) / len(scores) if scores else 0
+    return avg_sentiment
 
-def get_detailed_risk_info(text):
-    """
-    Returns detailed risk information by merging risk scores with descriptive details
-    and contextual summaries from the document.
-    """
-    risk_details = {
-        "Liability": {
-            "description": "Liability refers to the legal responsibility for losses or damages.",
-            "common_concerns": "Broad liability clauses may expose parties to unforeseen risks.",
-            "recommendations": "Review and negotiate clear limits on liability.",
-            "example": "E.g., 'The party shall be liable for direct damages due to negligence.'"
-        },
-        "Termination": {
-            "description": "Termination involves conditions under which a contract can be ended.",
-            "common_concerns": "Unilateral termination rights or ambiguous conditions can be risky.",
-            "recommendations": "Ensure termination clauses are balanced and include notice periods.",
-            "example": "E.g., 'Either party may terminate the agreement with 30 days notice.'"
-        },
-        "Indemnification": {
-            "description": "Indemnification requires one party to compensate for losses incurred by the other.",
-            "common_concerns": "Overly broad indemnification can shift significant risk.",
-            "recommendations": "Negotiate clear limits and carve-outs where necessary.",
-            "example": "E.g., 'The seller shall indemnify the buyer against claims from product defects.'"
-        },
-        "Payment Risk": {
-            "description": "Payment risk pertains to terms regarding fees, schedules, and reimbursements.",
-            "common_concerns": "Vague payment terms or hidden charges increase risk.",
-            "recommendations": "Clarify payment conditions and include penalties for delays.",
-            "example": "E.g., 'Payments must be made within 30 days, with a 2% late fee thereafter.'"
-        },
-        "Insurance": {
-            "description": "Insurance risk covers the adequacy and scope of required coverage.",
-            "common_concerns": "Insufficient insurance can leave parties exposed in unexpected events.",
-            "recommendations": "Review insurance requirements to ensure they meet the risk profile.",
-            "example": "E.g., 'The contractor must maintain liability insurance with at least $1M coverage.'"
-        }
-    }
-    risk_scores = analyze_risk(text)
-    risk_keywords_context = {
-        "Liability": {"keywords": ["liability", "responsible", "responsibility", "legal obligation"]},
-        "Termination": {"keywords": ["termination", "breach", "contract end", "default"]},
-        "Indemnification": {"keywords": ["indemnification", "indemnify", "hold harmless", "compensate", "compensation"]},
-        "Payment Risk": {"keywords": ["payment", "terms", "reimbursement", "fee", "schedule", "invoice", "money"]},
-        "Insurance": {"keywords": ["insurance", "coverage", "policy", "claims"]}
-    }
-    risk_contexts = extract_context_for_risk_terms(text, risk_keywords_context, window=1)
-    detailed_info = {}
-    for risk_term, score in risk_scores.items():
-        if score > 0:
-            info = risk_details.get(risk_term, {"description": "No details available."})
-            detailed_info[risk_term] = {
-                "score": score,
-                "description": info.get("description", ""),
-                "common_concerns": info.get("common_concerns", ""),
-                "recommendations": info.get("recommendations", ""),
-                "example": info.get("example", ""),
-                "context_summary": risk_contexts.get(risk_term, "No context available.")
-            }
-    return detailed_info
+def analyze_topics(text, num_topics=3):
+    tokens = gensim.utils.simple_preprocess(text, deacc=True)
+    if not tokens:
+        return []
+    dictionary = corpora.Dictionary([tokens])
+    corpus = [dictionary.doc2bow(tokens)]
+    lda_model = models.LdaModel(corpus, num_topics=num_topics, id2word=dictionary, passes=10)
+    topics = lda_model.print_topics(num_topics=num_topics)
+    return topics
+
+def get_enhanced_context_info(text):
+    enhanced = {}
+    enhanced["average_sentiment"] = analyze_sentiment(text)
+    enhanced["topics"] = analyze_topics(text, num_topics=5)
+    return enhanced
+
+def analyze_risk_enhanced(text):
+    enhanced = get_enhanced_context_info(text)
+    avg_sentiment = enhanced["average_sentiment"]
+    risk_score = abs(avg_sentiment) if avg_sentiment < 0 else 0
+    return {"risk_score": risk_score, "average_sentiment": avg_sentiment, "topics": enhanced["topics"]}
 
 def analyze_contract_clauses(text):
-    """Analyzes contract clauses using the fine-tuned CUAD QA model."""
     max_length = 512
     step = 256
     clauses_detected = []
     try:
         clause_types = list(cuad_model.config.id2label.values())
-    except Exception as e:
+    except Exception:
         clause_types = [
             "Obligations of Seller", "Governing Law", "Termination", "Indemnification",
             "Confidentiality", "Insurance", "Non-Compete", "Change of Control",
@@ -415,50 +356,52 @@ def analyze_contract_clauses(text):
             aggregated_clauses[clause_type] = clause
     return list(aggregated_clauses.values())
 
+# -----------------------------
+# Endpoints
+# -----------------------------
+
 @app.post("/analyze_legal_document")
 async def analyze_legal_document(file: UploadFile = File(...)):
-    """Analyzes a legal document for clause detection and compliance risks."""
     try:
-        print(f"Processing file: {file.filename}")
         content = await file.read()
-        text = extract_text_from_pdf(io.BytesIO(content))
+        file_hash = compute_md5(content)
+        # Return cached result if available
+        if file_hash in analysis_cache:
+            return analysis_cache[file_hash]
+        text = await run_in_threadpool(extract_text_from_pdf, io.BytesIO(content))
         if not text:
             return {"status": "error", "message": "No valid text found in the document."}
         summary_text = text[:4096] if len(text) > 4096 else text
         summary = summarizer(summary_text, max_length=200, min_length=50, do_sample=False)[0]['summary_text'] if len(text) > 100 else "Document too short for meaningful summarization."
-        print("Extracting named entities...")
         entities = extract_named_entities(text)
-        print("Analyzing risk...")
-        risk_scores = analyze_risk(text)
-        detailed_risk = get_detailed_risk_info(text)
-        print("Analyzing contract clauses...")
+        risk_analysis = analyze_risk_enhanced(text)
         clauses = analyze_contract_clauses(text)
         generated_task_id = str(uuid.uuid4())
         store_document_context(generated_task_id, text)
-        return {
+        result = {
             "status": "success",
             "task_id": generated_task_id,
             "summary": summary,
             "named_entities": entities,
-            "risk_scores": risk_scores,
-            "detailed_risk": detailed_risk,
+            "risk_analysis": risk_analysis,
             "clauses_detected": clauses
         }
+        analysis_cache[file_hash] = result
+        return result
     except Exception as e:
-        print(f"Error processing document: {str(e)}")
         return {"status": "error", "message": str(e)}
 
 @app.post("/analyze_legal_video")
-async def analyze_legal_video(file: UploadFile = File(...)):
-    """Analyzes a legal video by transcribing audio and analyzing the transcript."""
+async def analyze_legal_video(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
     try:
-        print(f"Processing video file: {file.filename}")
         content = await file.read()
+        file_hash = compute_md5(content)
+        if file_hash in analysis_cache:
+            return analysis_cache[file_hash]
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
             temp_file.write(content)
             temp_file_path = temp_file.name
-        print(f"Temporary file saved at: {temp_file_path}")
-        text = process_video_to_text(temp_file_path)
+        text = await process_video_to_text(temp_file_path)
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         if not text:
@@ -468,41 +411,37 @@ async def analyze_legal_video(file: UploadFile = File(...)):
             f.write(text)
         summary_text = text[:4096] if len(text) > 4096 else text
         summary = summarizer(summary_text, max_length=200, min_length=50, do_sample=False)[0]['summary_text'] if len(text) > 100 else "Transcript too short for meaningful summarization."
-        print("Extracting named entities from transcript...")
         entities = extract_named_entities(text)
-        print("Analyzing risk from transcript...")
-        risk_scores = analyze_risk(text)
-        detailed_risk = get_detailed_risk_info(text)
-        print("Analyzing legal clauses from transcript...")
+        risk_analysis = analyze_risk_enhanced(text)
         clauses = analyze_contract_clauses(text)
         generated_task_id = str(uuid.uuid4())
         store_document_context(generated_task_id, text)
-        return {
+        result = {
             "status": "success",
             "task_id": generated_task_id,
             "transcript": text,
             "transcript_path": transcript_path,
             "summary": summary,
             "named_entities": entities,
-            "risk_scores": risk_scores,
-            "detailed_risk": detailed_risk,
+            "risk_analysis": risk_analysis,
             "clauses_detected": clauses
         }
+        analysis_cache[file_hash] = result
+        return result
     except Exception as e:
-        print(f"Error processing video: {str(e)}")
         return {"status": "error", "message": str(e)}
 
 @app.post("/analyze_legal_audio")
-async def analyze_legal_audio(file: UploadFile = File(...)):
-    """Analyzes legal audio by transcribing and analyzing the transcript."""
+async def analyze_legal_audio(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
     try:
-        print(f"Processing audio file: {file.filename}")
         content = await file.read()
+        file_hash = compute_md5(content)
+        if file_hash in analysis_cache:
+            return analysis_cache[file_hash]
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
             temp_file.write(content)
             temp_file_path = temp_file.name
-        print(f"Temporary file saved at: {temp_file_path}")
-        text = process_audio_to_text(temp_file_path)
+        text = await process_audio_to_text(temp_audio_path=temp_file_path)
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         if not text:
@@ -512,33 +451,28 @@ async def analyze_legal_audio(file: UploadFile = File(...)):
             f.write(text)
         summary_text = text[:4096] if len(text) > 4096 else text
         summary = summarizer(summary_text, max_length=200, min_length=50, do_sample=False)[0]['summary_text'] if len(text) > 100 else "Transcript too short for meaningful summarization."
-        print("Extracting named entities from transcript...")
         entities = extract_named_entities(text)
-        print("Analyzing risk from transcript...")
-        risk_scores = analyze_risk(text)
-        detailed_risk = get_detailed_risk_info(text)
-        print("Analyzing legal clauses from transcript...")
+        risk_analysis = analyze_risk_enhanced(text)
         clauses = analyze_contract_clauses(text)
         generated_task_id = str(uuid.uuid4())
         store_document_context(generated_task_id, text)
-        return {
+        result = {
             "status": "success",
             "task_id": generated_task_id,
             "transcript": text,
             "transcript_path": transcript_path,
             "summary": summary,
             "named_entities": entities,
-            "risk_scores": risk_scores,
-            "detailed_risk": detailed_risk,
+            "risk_analysis": risk_analysis,
             "clauses_detected": clauses
         }
+        analysis_cache[file_hash] = result
+        return result
     except Exception as e:
-        print(f"Error processing audio: {str(e)}")
         return {"status": "error", "message": str(e)}
 
 @app.get("/transcript/{transcript_id}")
 async def get_transcript(transcript_id: str):
-    """Retrieves a previously generated transcript."""
     transcript_path = os.path.join("static", f"transcript_{transcript_id}.txt")
     if os.path.exists(transcript_path):
         return FileResponse(transcript_path)
@@ -547,7 +481,6 @@ async def get_transcript(transcript_id: str):
 
 @app.post("/legal_chatbot")
 async def legal_chatbot_api(query: str = Form(...), task_id: str = Form(...)):
-    """Handles legal Q&A using chat history and document context."""
     document_context = load_document_context(task_id)
     if not document_context:
         return {"response": "⚠️ No relevant document found for this task ID."}
@@ -565,7 +498,6 @@ async def health_check():
     }
 
 def setup_ngrok():
-    """Sets up ngrok tunnel for Google Colab."""
     try:
         auth_token = os.environ.get("NGROK_AUTH_TOKEN")
         if auth_token:
@@ -592,63 +524,59 @@ def setup_ngrok():
         print(f"⚠️ Ngrok setup error: {e}")
         return None
 
+# ------------------------------
+# Dynamic Visualization Endpoints
+# ------------------------------
+
 @app.get("/download_risk_chart")
-async def download_risk_chart():
-    """Generate and return a risk assessment chart as an image file."""
+async def download_risk_chart(task_id: str):
     try:
-        os.makedirs("static", exist_ok=True)
-        risk_scores = {
-            "Liability": 11,
-            "Termination": 12,
-            "Indemnification": 10,
-            "Payment Risk": 41,
-            "Insurance": 71
-        }
+        text = load_document_context(task_id)
+        if not text:
+            raise HTTPException(status_code=404, detail="Document context not found")
+        risk_analysis = analyze_risk_enhanced(text)
         plt.figure(figsize=(8, 5))
-        plt.bar(risk_scores.keys(), risk_scores.values(), color='red')
-        plt.xlabel("Risk Categories")
+        plt.bar(["Risk Score"], [risk_analysis["risk_score"]], color='red')
         plt.ylabel("Risk Score")
-        plt.title("Legal Risk Assessment")
-        plt.xticks(rotation=30)
-        risk_chart_path = "static/risk_chart.png"
+        plt.title("Legal Risk Assessment (Enhanced)")
+        risk_chart_path = os.path.join("static", f"risk_chart_{task_id}.png")
         plt.savefig(risk_chart_path)
         plt.close()
-        return FileResponse(risk_chart_path, media_type="image/png", filename="risk_chart.png")
+        return FileResponse(risk_chart_path, media_type="image/png", filename=f"risk_chart_{task_id}.png")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating risk chart: {str(e)}")
 
 @app.get("/download_risk_pie_chart")
-async def download_risk_pie_chart():
+async def download_risk_pie_chart(task_id: str):
     try:
-        risk_scores = {
-            "Liability": 11,
-            "Termination": 12,
-            "Indemnification": 10,
-            "Payment Risk": 41,
-            "Insurance": 71
-        }
+        text = load_document_context(task_id)
+        if not text:
+            raise HTTPException(status_code=404, detail="Document context not found")
+        risk_analysis = analyze_risk_enhanced(text)
+        labels = ["Risk", "No Risk"]
+        # Ensure the values are within [0,1]
+        risk_value = risk_analysis["risk_score"]
+        risk_value = min(max(risk_value, 0), 1)
+        values = [risk_value, 1 - risk_value]
         plt.figure(figsize=(6, 6))
-        plt.pie(risk_scores.values(), labels=risk_scores.keys(), autopct='%1.1f%%', startangle=90)
-        plt.title("Legal Risk Distribution")
-        pie_chart_path = "static/risk_pie_chart.png"
+        plt.pie(values, labels=labels, autopct='%1.1f%%', startangle=90)
+        plt.title("Legal Risk Distribution (Enhanced)")
+        pie_chart_path = os.path.join("static", f"risk_pie_chart_{task_id}.png")
         plt.savefig(pie_chart_path)
         plt.close()
-        return FileResponse(pie_chart_path, media_type="image/png", filename="risk_pie_chart.png")
+        return FileResponse(pie_chart_path, media_type="image/png", filename=f"risk_pie_chart_{task_id}.png")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating pie chart: {str(e)}")
 
 @app.get("/download_risk_radar_chart")
-async def download_risk_radar_chart():
+async def download_risk_radar_chart(task_id: str):
     try:
-        risk_scores = {
-            "Liability": 11,
-            "Termination": 12,
-            "Indemnification": 10,
-            "Payment Risk": 41,
-            "Insurance": 71
-        }
-        categories = list(risk_scores.keys())
-        values = list(risk_scores.values())
+        text = load_document_context(task_id)
+        if not text:
+            raise HTTPException(status_code=404, detail="Document context not found")
+        risk_analysis = analyze_risk_enhanced(text)
+        categories = ["Average Sentiment", "Risk Score"]
+        values = [risk_analysis["average_sentiment"], risk_analysis["risk_score"]]
         categories += categories[:1]
         values += values[:1]
         angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
@@ -656,66 +584,61 @@ async def download_risk_radar_chart():
         fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
         ax.plot(angles, values, 'o-', linewidth=2)
         ax.fill(angles, values, alpha=0.25)
-        ax.set_thetagrids(np.degrees(angles[:-1]), categories)
-        ax.set_title("Legal Risk Radar Chart", y=1.1)
-        radar_chart_path = "static/risk_radar_chart.png"
+        ax.set_thetagrids(np.degrees(angles[:-1]), ["Sentiment", "Risk"])
+        ax.set_title("Legal Risk Radar Chart (Enhanced)", y=1.1)
+        radar_chart_path = os.path.join("static", f"risk_radar_chart_{task_id}.png")
         plt.savefig(radar_chart_path)
         plt.close()
-        return FileResponse(radar_chart_path, media_type="image/png", filename="risk_radar_chart.png")
+        return FileResponse(radar_chart_path, media_type="image/png", filename=f"risk_radar_chart_{task_id}.png")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating radar chart: {str(e)}")
 
 @app.get("/download_risk_trend_chart")
-async def download_risk_trend_chart():
+async def download_risk_trend_chart(task_id: str):
     try:
-        dates = ["2025-01-01", "2025-02-01", "2025-03-01", "2025-04-01"]
-        risk_history = {
-            "Liability": [10, 12, 11, 13],
-            "Termination": [12, 15, 14, 13],
-            "Indemnification": [9, 10, 11, 10],
-            "Payment Risk": [40, 42, 41, 43],
-            "Insurance": [70, 69, 71, 72]
-        }
+        text = load_document_context(task_id)
+        if not text:
+            raise HTTPException(status_code=404, detail="Document context not found")
+        words = text.split()
+        segments = np.array_split(words, 4)
+        segment_texts = [" ".join(segment) for segment in segments]
+        trend_scores = []
+        for segment in segment_texts:
+            risk = analyze_risk_enhanced(segment)
+            trend_scores.append(risk["risk_score"])
+        segments_labels = [f"Segment {i+1}" for i in range(len(segment_texts))]
         plt.figure(figsize=(10, 6))
-        for category, scores in risk_history.items():
-            plt.plot(dates, scores, marker='o', label=category)
-        plt.xlabel("Date")
+        plt.plot(segments_labels, trend_scores, marker='o')
+        plt.xlabel("Document Segments")
         plt.ylabel("Risk Score")
-        plt.title("Historical Legal Risk Trends")
+        plt.title("Dynamic Legal Risk Trends (Enhanced)")
         plt.xticks(rotation=45)
-        plt.legend()
-        trend_chart_path = "static/risk_trend_chart.png"
+        trend_chart_path = os.path.join("static", f"risk_trend_chart_{task_id}.png")
         plt.savefig(trend_chart_path, bbox_inches="tight")
         plt.close()
-        return FileResponse(trend_chart_path, media_type="image/png", filename="risk_trend_chart.png")
+        return FileResponse(trend_chart_path, media_type="image/png", filename=f"risk_trend_chart_{task_id}.png")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating trend chart: {str(e)}")
 
-import pandas as pd
-import plotly.express as px
-from fastapi.responses import HTMLResponse
-
 @app.get("/interactive_risk_chart", response_class=HTMLResponse)
-async def interactive_risk_chart():
+async def interactive_risk_chart(task_id: str):
     try:
-        risk_scores = {
-            "Liability": 11,
-            "Termination": 12,
-            "Indemnification": 10,
-            "Payment Risk": 41,
-            "Insurance": 71
-        }
+        import pandas as pd
+        import plotly.express as px
+        text = load_document_context(task_id)
+        if not text:
+            raise HTTPException(status_code=404, detail="Document context not found")
+        risk_analysis = analyze_risk_enhanced(text)
         df = pd.DataFrame({
-            "Risk Category": list(risk_scores.keys()),
-            "Risk Score": list(risk_scores.values())
+            "Metric": ["Average Sentiment", "Risk Score"],
+            "Value": [risk_analysis["average_sentiment"], risk_analysis["risk_score"]]
         })
-        fig = px.bar(df, x="Risk Category", y="Risk Score", title="Interactive Legal Risk Assessment")
+        fig = px.bar(df, x="Metric", y="Value", title="Interactive Enhanced Legal Risk Assessment")
         return fig.to_html()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating interactive chart: {str(e)}")
 
 def run():
-    """Starts the FastAPI server."""
     print("Starting FastAPI server...")
     uvicorn.run(app, host="0.0.0.0", port=8500, timeout_keep_alive=600)
 
@@ -726,3 +649,4 @@ if __name__ == "__main__":
     else:
         print("\n⚠️ Ngrok setup failed. API will only be available locally.\n")
     run()
+
