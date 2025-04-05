@@ -13,7 +13,7 @@ import numpy as np
 import json
 import tempfile
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse, HTMLResponse  # Added HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import pipeline, AutoModelForQuestionAnswering, AutoTokenizer
 from sentence_transformers import SentenceTransformer
@@ -30,6 +30,9 @@ from starlette.concurrency import run_in_threadpool
 # Import gensim for topic modeling
 import gensim
 from gensim import corpora, models
+
+# Import spacy stop words
+from spacy.lang.en.stop_words import STOP_WORDS
 
 # Global cache for analysis results based on file hash
 analysis_cache = {}
@@ -196,16 +199,19 @@ try:
         spacy.cli.download("en_core_web_sm")
         nlp = spacy.load("en_core_web_sm")
     print("✅ Loading NLP models...")
-    from transformers import PegasusTokenizer
+
+    # Update summarizer to use facebook/bart-large-cnn for summarization
     summarizer = pipeline(
         "summarization",
-        model="nsi319/legal-pegasus",
-        tokenizer=PegasusTokenizer.from_pretrained("nsi319/legal-pegasus", use_fast=False),
+        model="facebook/bart-large-cnn",
+        tokenizer="facebook/bart-large-cnn",
         device=0 if torch.cuda.is_available() else -1
     )
-    # Optionally convert summarizer model to FP16 for faster inference on GPU
     if device == "cuda":
-        summarizer.model.half()
+        try:
+            summarizer.model.half()
+        except Exception as e:
+            print("FP16 conversion failed:", e)
 
     embedding_model = SentenceTransformer("all-mpnet-base-v2", device=device)
     ner_model = pipeline("ner", model="dslim/bert-base-NER", device=0 if torch.cuda.is_available() else -1)
@@ -230,8 +236,6 @@ except Exception as e:
 
 from transformers import pipeline
 qa_model = pipeline("question-answering", model="deepset/roberta-base-squad2")
-
-# Initialize sentiment-analysis pipeline
 sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english", device=0 if torch.cuda.is_available() else -1)
 
 def legal_chatbot(user_input, context):
@@ -258,10 +262,8 @@ async def process_video_to_text(video_file_path):
             "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
             temp_audio_path, "-y"
         ]
-        # Run ffmpeg in a separate thread
         await run_in_threadpool(subprocess.run, cmd, check=True)
         print(f"Audio extracted to {temp_audio_path}")
-        # Run speech-to-text in threadpool
         result = await run_in_threadpool(speech_to_text, temp_audio_path)
         transcript = result["text"]
         print(f"Transcription completed: {len(transcript)} characters")
@@ -321,11 +323,61 @@ def get_enhanced_context_info(text):
     enhanced["topics"] = analyze_topics(text, num_topics=5)
     return enhanced
 
+# New function to create a detailed, dynamic explanation for each topic
+def explain_topics(topics):
+    explanation = {}
+    for topic_idx, topic_str in topics:
+        # Split topic string into individual weighted terms
+        parts = topic_str.split('+')
+        terms = []
+        for part in parts:
+            part = part.strip()
+            if '*' in part:
+                weight_str, word = part.split('*', 1)
+                word = word.strip().strip('\"').strip('\'')
+                try:
+                    weight = float(weight_str)
+                except:
+                    weight = 0.0
+                # Filter out common stop words
+                if word.lower() not in STOP_WORDS and len(word) > 1:
+                    terms.append((weight, word))
+        terms.sort(key=lambda x: -x[0])
+        # Create a plain language label based on dominant words
+        if terms:
+            if any("liability" in word.lower() for weight, word in terms):
+                label = "Liability & Penalty Risk"
+            elif any("termination" in word.lower() for weight, word in terms):
+                label = "Termination & Refund Risk"
+            elif any("compliance" in word.lower() for weight, word in terms):
+                label = "Compliance & Regulatory Risk"
+            else:
+                label = "General Risk Language"
+        else:
+            label = "General Risk Language"
+        explanation_text = (
+            f"Topic {topic_idx} ({label}) is characterized by dominant terms: " +
+            ", ".join([f"'{word}' ({weight:.3f})" for weight, word in terms[:5]])
+        )
+        explanation[topic_idx] = {
+            "label": label,
+            "explanation": explanation_text,
+            "terms": terms
+        }
+    return explanation
+
 def analyze_risk_enhanced(text):
     enhanced = get_enhanced_context_info(text)
     avg_sentiment = enhanced["average_sentiment"]
     risk_score = abs(avg_sentiment) if avg_sentiment < 0 else 0
-    return {"risk_score": risk_score, "average_sentiment": avg_sentiment, "topics": enhanced["topics"]}
+    topics_raw = enhanced["topics"]
+    topics_explanation = explain_topics(topics_raw)
+    return {
+        "risk_score": risk_score,
+        "average_sentiment": avg_sentiment,
+        "topics": topics_raw,
+        "topics_explanation": topics_explanation
+    }
 
 def analyze_contract_clauses(text):
     max_length = 512
@@ -365,7 +417,6 @@ async def analyze_legal_document(file: UploadFile = File(...)):
     try:
         content = await file.read()
         file_hash = compute_md5(content)
-        # Return cached result if available
         if file_hash in analysis_cache:
             return analysis_cache[file_hash]
         text = await run_in_threadpool(extract_text_from_pdf, io.BytesIO(content))
@@ -525,118 +576,87 @@ def setup_ngrok():
         return None
 
 # ------------------------------
-# Dynamic Visualization Endpoints
+# Clause Visualization Endpoints
 # ------------------------------
 
-@app.get("/download_risk_chart")
-async def download_risk_chart(task_id: str):
+@app.get("/download_clause_bar_chart")
+async def download_clause_bar_chart(task_id: str):
     try:
         text = load_document_context(task_id)
         if not text:
             raise HTTPException(status_code=404, detail="Document context not found")
-        risk_analysis = analyze_risk_enhanced(text)
-        plt.figure(figsize=(8, 5))
-        plt.bar(["Risk Score"], [risk_analysis["risk_score"]], color='red')
-        plt.ylabel("Risk Score")
-        plt.title("Legal Risk Assessment (Enhanced)")
-        risk_chart_path = os.path.join("static", f"risk_chart_{task_id}.png")
-        plt.savefig(risk_chart_path)
+        clauses = analyze_contract_clauses(text)
+        if not clauses:
+            raise HTTPException(status_code=404, detail="No clauses detected.")
+        clause_types = [c["type"] for c in clauses]
+        confidences = [c["confidence"] for c in clauses]
+        plt.figure(figsize=(10, 6))
+        plt.bar(clause_types, confidences, color='blue')
+        plt.xlabel("Clause Type")
+        plt.ylabel("Confidence Score")
+        plt.title("Extracted Legal Clause Confidence Scores")
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+        bar_chart_path = os.path.join("static", f"clause_bar_chart_{task_id}.png")
+        plt.savefig(bar_chart_path)
         plt.close()
-        return FileResponse(risk_chart_path, media_type="image/png", filename=f"risk_chart_{task_id}.png")
+        return FileResponse(bar_chart_path, media_type="image/png", filename=f"clause_bar_chart_{task_id}.png")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating risk chart: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating clause bar chart: {str(e)}")
 
-@app.get("/download_risk_pie_chart")
-async def download_risk_pie_chart(task_id: str):
+@app.get("/download_clause_donut_chart")
+async def download_clause_donut_chart(task_id: str):
     try:
         text = load_document_context(task_id)
         if not text:
             raise HTTPException(status_code=404, detail="Document context not found")
-        risk_analysis = analyze_risk_enhanced(text)
-        labels = ["Risk", "No Risk"]
-        # Ensure the values are within [0,1]
-        risk_value = risk_analysis["risk_score"]
-        risk_value = min(max(risk_value, 0), 1)
-        values = [risk_value, 1 - risk_value]
+        clauses = analyze_contract_clauses(text)
+        if not clauses:
+            raise HTTPException(status_code=404, detail="No clauses detected.")
+        from collections import Counter
+        clause_counter = Counter([c["type"] for c in clauses])
+        labels = list(clause_counter.keys())
+        sizes = list(clause_counter.values())
         plt.figure(figsize=(6, 6))
-        plt.pie(values, labels=labels, autopct='%1.1f%%', startangle=90)
-        plt.title("Legal Risk Distribution (Enhanced)")
-        pie_chart_path = os.path.join("static", f"risk_pie_chart_{task_id}.png")
-        plt.savefig(pie_chart_path)
+        wedges, texts, autotexts = plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+        centre_circle = plt.Circle((0, 0), 0.70, fc='white')
+        fig = plt.gcf()
+        fig.gca().add_artist(centre_circle)
+        plt.title("Clause Type Distribution")
+        plt.tight_layout()
+        donut_chart_path = os.path.join("static", f"clause_donut_chart_{task_id}.png")
+        plt.savefig(donut_chart_path)
         plt.close()
-        return FileResponse(pie_chart_path, media_type="image/png", filename=f"risk_pie_chart_{task_id}.png")
+        return FileResponse(donut_chart_path, media_type="image/png", filename=f"clause_donut_chart_{task_id}.png")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating pie chart: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating clause donut chart: {str(e)}")
 
-@app.get("/download_risk_radar_chart")
-async def download_risk_radar_chart(task_id: str):
+@app.get("/download_clause_radar_chart")
+async def download_clause_radar_chart(task_id: str):
     try:
         text = load_document_context(task_id)
         if not text:
             raise HTTPException(status_code=404, detail="Document context not found")
-        risk_analysis = analyze_risk_enhanced(text)
-        categories = ["Average Sentiment", "Risk Score"]
-        values = [risk_analysis["average_sentiment"], risk_analysis["risk_score"]]
-        categories += categories[:1]
+        clauses = analyze_contract_clauses(text)
+        if not clauses:
+            raise HTTPException(status_code=404, detail="No clauses detected.")
+        labels = [c["type"] for c in clauses]
+        values = [c["confidence"] for c in clauses]
+        labels += labels[:1]
         values += values[:1]
-        angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+        angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
         angles += angles[:1]
         fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
         ax.plot(angles, values, 'o-', linewidth=2)
         ax.fill(angles, values, alpha=0.25)
-        ax.set_thetagrids(np.degrees(angles[:-1]), ["Sentiment", "Risk"])
-        ax.set_title("Legal Risk Radar Chart (Enhanced)", y=1.1)
-        radar_chart_path = os.path.join("static", f"risk_radar_chart_{task_id}.png")
+        ax.set_thetagrids(np.degrees(angles[:-1]), labels[:-1])
+        ax.set_title("Legal Clause Radar Chart", y=1.1)
+        radar_chart_path = os.path.join("static", f"clause_radar_chart_{task_id}.png")
         plt.savefig(radar_chart_path)
         plt.close()
-        return FileResponse(radar_chart_path, media_type="image/png", filename=f"risk_radar_chart_{task_id}.png")
+        return FileResponse(radar_chart_path, media_type="image/png", filename=f"clause_radar_chart_{task_id}.png")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating radar chart: {str(e)}")
-
-@app.get("/download_risk_trend_chart")
-async def download_risk_trend_chart(task_id: str):
-    try:
-        text = load_document_context(task_id)
-        if not text:
-            raise HTTPException(status_code=404, detail="Document context not found")
-        words = text.split()
-        segments = np.array_split(words, 4)
-        segment_texts = [" ".join(segment) for segment in segments]
-        trend_scores = []
-        for segment in segment_texts:
-            risk = analyze_risk_enhanced(segment)
-            trend_scores.append(risk["risk_score"])
-        segments_labels = [f"Segment {i+1}" for i in range(len(segment_texts))]
-        plt.figure(figsize=(10, 6))
-        plt.plot(segments_labels, trend_scores, marker='o')
-        plt.xlabel("Document Segments")
-        plt.ylabel("Risk Score")
-        plt.title("Dynamic Legal Risk Trends (Enhanced)")
-        plt.xticks(rotation=45)
-        trend_chart_path = os.path.join("static", f"risk_trend_chart_{task_id}.png")
-        plt.savefig(trend_chart_path, bbox_inches="tight")
-        plt.close()
-        return FileResponse(trend_chart_path, media_type="image/png", filename=f"risk_trend_chart_{task_id}.png")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating trend chart: {str(e)}")
-
-@app.get("/interactive_risk_chart", response_class=HTMLResponse)
-async def interactive_risk_chart(task_id: str):
-    try:
-        import pandas as pd
-        import plotly.express as px
-        text = load_document_context(task_id)
-        if not text:
-            raise HTTPException(status_code=404, detail="Document context not found")
-        risk_analysis = analyze_risk_enhanced(text)
-        df = pd.DataFrame({
-            "Metric": ["Average Sentiment", "Risk Score"],
-            "Value": [risk_analysis["average_sentiment"], risk_analysis["risk_score"]]
-        })
-        fig = px.bar(df, x="Metric", y="Value", title="Interactive Enhanced Legal Risk Assessment")
-        return fig.to_html()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating interactive chart: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating clause radar chart: {str(e)}")
 
 def run():
     print("Starting FastAPI server...")
